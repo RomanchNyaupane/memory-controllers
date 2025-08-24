@@ -24,7 +24,7 @@ reg start_ref_cnt;
 reg [20:0] x;
 
 parameter INITIALIZATION = 1, IDLE = 2, READ = 3, WRITE = 4, NOP=5, ACTIVATE = 6;
-parameter PRECHARGE_ALL = 7, REFRESH = 8, SET_MODE = 9; DATA_IN = 10;
+parameter PRECHARGE_ALL = 7, REFRESH = 8, SET_MODE = 9, DATA_IN = 10;
 reg [3:0] state, next_state, return_state;
 
 reg[13:0] initialization_count;
@@ -36,6 +36,7 @@ reg [7:0] data_in; //data read from SDRAM
 reg [1:0] nop_count; //count for NOP command
 
 reg rd_active, wr_active; //indicates whether read or write operation is active
+reg rcd_ack;
 /*
 Device deselect (DESL) cke=1, cs_=0, ras_= x, cas_= x, wr_en_= x, bank_out = 2'bxx, a10 = x, a9:a0 = x
 No operation (NOP) cke=1, cs_=0, ras_= 1, cas_= 1, wr_en_= 1, bank_out = 2'bxx, a10 = x, a9:a0 = x
@@ -62,7 +63,8 @@ RCD_timer rcd_timer(
     .clk(clk),
     .reset(reset),
     .start(rcd_start),
-    .interrupt(rcd_int)
+    .interrupt(rcd_int),
+    .rcd_ack(rcd_ack)
 );
 RCD_timer cas_timer(
     .clk(clk),
@@ -81,7 +83,7 @@ always @ (posedge clk) begin
         x<=0;
     end else begin
         state <= next_state;
-        nop_count <= nop_count_next; //update NOP count
+        //update NOP count
         if(state == NOP) begin
             if(nop_count > 0) nop_count <= nop_count - 1;
             else nop_count <= 0;
@@ -101,9 +103,10 @@ questions left for future analysis:
    should be done in that case?
 */
 
-always @(state, rd_req, wr_req, rd_gnt, wr_gnt, rd_data, in_addr, reset, initialization_count) begin
+always @(nop_count, state, rd_req, wr_req, rd_gnt, wr_gnt, rd_data, in_addr, reset, initialization_count, ref_int) begin
 if(!reset) begin
     return_state = return_state;
+    rcd_ack = 0;
     case(state)
         INITIALIZATION: begin
             if(initialization_count < 14'd14310) begin
@@ -131,15 +134,15 @@ if(!reset) begin
         IDLE: begin
             initial_refresh = 0;
             start_ref_cnt = 1;
-
+            wr_gnt = 0;
             // the idle state is only for waiting for requests. the chip needs NOP command explicitly if no request is present
             cke = 1; cs_ = 0; ras_ = 1;
             cas_ = 1; wr_en_ = 1;
 
             if(ref_int) begin
                 next_state = REFRESH;
-                initial_refresh_count = 0; //store the initial refresh count
-            end
+                x=3;
+            end else begin
             if(rd_req | wr_req) begin
                 next_state = ACTIVATE;
                 rcd_start = 1; //start the RCD timer
@@ -147,6 +150,7 @@ if(!reset) begin
                 next_state = NOP; //do not start the RCD timer
                 nop_count = 2'b00;
                 return_state = IDLE; //stay in idle state
+            end
             end
         end
         REFRESH: begin      //CBR auto refresh
@@ -171,25 +175,21 @@ if(!reset) begin
         ACTIVATE: begin     //activate a row in a bank
             cke = 1; cs_ = 0; ras_ = 0;
             cas_ = 1; wr_en_ = 1;
-            if(rcd_int) begin
-                addr_out[9:0] = in_addr[11:2]; //set the column address
-                next_state = rd_req ? READ :  WRITE; //go to read or write state after activating row
-                cas_start = 1; //start the CAS timer
-            end else begin
-                addr_out[11:0] = in_addr[11:0]; //use the row address from read request
-                bank_out = in_addr[23:22]; //use the bank address from read request
-                next_state = NOP; //do not start the RCD timer
-                nop_count = 2'b10; //wait in NOP state for 2 cycles 
-                return_state = ACTIVATE; //stay in idle states
-            end
+
+            addr_out[11:0] = in_addr[11:0]; //use the row address from read request
+            bank_out = in_addr[23:22]; //use the bank address from read request
+            next_state = NOP; //do not start the RCD timer
+            nop_count = 2'b10; //wait in NOP state for 2 cycles 
+            return_state = rd_req ? READ :  WRITE; 
         end
         READ: begin //read with auto precharge
             cke = 1; cs_ = 0; ras_ = 1;
             cas_ = 0; wr_en_ = 1;
             addr_out[10] = 1;
             rd_gnt = 1;
+            rcd_ack = 0;
             
-            next_state = NOP; //go to read precharge state after read operation
+            next_state = NOP; 
             return_state = DATA_IN;
             nop_count = 2'b10; //wait in NOP state for  2 cycles to allow data to be read from SDRAM
         end
@@ -197,6 +197,7 @@ if(!reset) begin
             cke = 1; cs_ = 0; ras_ = 1;
             cas_ = 0; wr_en_ = 0;
             wr_gnt = 1;
+            rcd_ack = 0;
             addr_out[10] = 1; //write with auto precharge
             wr_data_o = wr_data; //write data to SDRAM
 
@@ -221,6 +222,7 @@ if(!reset) begin
             return_state = IDLE;
         end
         DATA_IN: begin
+            rd_gnt = 0;
             rd_data = rd_data_o; //read data from SDRAM
             rd_data_valid = 1;
             next_state = IDLE; //go back to idle after reading data
